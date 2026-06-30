@@ -1,14 +1,19 @@
 import os
+import json
 import sqlite3
 import logging
-from datetime import datetime, timedelta
+import requests
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +25,13 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_CHAT_IDS = [
     int(cid.strip()) for cid in os.environ["ALLOWED_CHAT_IDS"].split(",") if cid.strip()
 ]
+
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+# Часовой пояс для ежедневной сводки и распознавания "сегодня/завтра"
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Istanbul"))
+# Во сколько присылать утреннюю сводку (24-часовой формат, локальное время)
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "9"))
+DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE", "0"))
 
 DB_PATH = "events.db"
 
@@ -115,12 +127,19 @@ def list_active_events():
     return rows
 
 
+def now_local():
+    """Текущее время в часовом поясе пользователя (наивное, без tzinfo,
+    чтобы корректно сравниваться с event_time, который тоже хранится наивно
+    и подразумевает локальный часовой пояс)."""
+    return datetime.now(TIMEZONE).replace(tzinfo=None)
+
+
 def get_due_reminders():
     """Находит события, для которых пора слать напоминание."""
     conn = db()
     rows = conn.execute("SELECT * FROM events WHERE status = 'active'").fetchall()
     conn.close()
-    now = datetime.now()
+    now = now_local()
     due = []
     for row in rows:
         event_time = datetime.fromisoformat(row["event_time"])
@@ -136,7 +155,66 @@ def get_due_reminders():
 
 # ---------- ПАРСИНГ ДАТЫ/ВРЕМЕНИ ----------
 
-def parse_event_input(text: str):
+def parse_with_claude(text: str):
+    """
+    Отправляет свободный текст в Claude API, получает обратно
+    title и event_time (ISO). Возвращает (title, datetime) или None,
+    если Claude не смог распознать дату/время в тексте.
+    """
+    now = datetime.now(TIMEZONE)
+    system_prompt = (
+        f"Сегодня {now.strftime('%d.%m.%Y')} ({now.strftime('%A')}), "
+        f"текущее время {now.strftime('%H:%M')}, часовой пояс {TIMEZONE.key}.\n"
+        "Пользователь пишет сообщение с описанием события (на русском языке), "
+        "которое нужно превратить в напоминание. Извлеки короткое название события "
+        "и точные дату и время. Если время не указано явно, выбери разумное "
+        "(например, 'утром' = 09:00, 'днём' = 14:00, 'вечером' = 19:00). "
+        "Если дата не указана явно, но описание не похоже на событие "
+        "(нет ни даты, ни времени, ни намёка на 'завтра/сегодня/в пятницу' и т.п.), "
+        "верни valid=false.\n\n"
+        "Ответь СТРОГО в формате JSON, без пояснений и без markdown:\n"
+        '{"valid": true, "title": "...", "datetime": "ДД.ММ.ГГГГ ЧЧ:ММ"}\n'
+        "или\n"
+        '{"valid": false}'
+    )
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 300,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": text}],
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw_text = "".join(
+            block["text"] for block in data["content"] if block["type"] == "text"
+        ).strip()
+        raw_text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        parsed = json.loads(raw_text)
+
+        if not parsed.get("valid"):
+            return None
+
+        title = parsed["title"]
+        dt = datetime.strptime(parsed["datetime"], "%d.%m.%Y %H:%M")
+        return title, dt
+
+    except Exception as e:
+        logger.error(f"Ошибка распознавания через Claude API: {e}")
+        return None
+
+
+
     """
     Ожидает: Название | ДД.ММ.ГГГГ | ЧЧ:ММ
     Возвращает (title, datetime) или бросает ValueError
@@ -164,11 +242,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Привет! Я твой бот-трекер-календарь.\n\n"
-        "Добавить событие:\n"
+        "Можешь просто написать обычным текстом, например:\n"
+        "«созвон с Гузель завтра в 15»\n\n"
+        "Или строгим форматом:\n"
         "/new Название | ДД.ММ.ГГГГ | ЧЧ:ММ\n\n"
-        "Пример:\n"
-        "/new Созвон с Гузель | 03.07.2026 | 15:00\n\n"
-        "Посмотреть активные события: /list"
+        "Посмотреть активные события: /list\n"
+        f"Каждое утро в {DAILY_SUMMARY_HOUR:02d}:{DAILY_SUMMARY_MINUTE:02d} пришлю сводку на сегодня."
     )
 
 
@@ -182,7 +261,7 @@ async def new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(str(e))
         return
 
-    if dt <= datetime.now():
+    if dt <= now_local():
         await update.message.reply_text("Эта дата/время уже в прошлом, проверь ввод.")
         return
 
@@ -207,11 +286,45 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def free_text_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает обычные сообщения (без команды) — пробует распознать событие через Claude."""
+    if not await check_auth(update):
+        return
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    result = parse_with_claude(text)
+    if result is None:
+        await update.message.reply_text(
+            "Не смог распознать в этом сообщении событие с датой/временем.\n"
+            "Попробуй яснее, например: «созвон с Гузель завтра в 15»\n"
+            "Или используй строгий формат: /new Название | ДД.ММ.ГГГГ | ЧЧ:ММ"
+        )
+        return
+
+    title, dt = result
+    if dt <= now_local():
+        await update.message.reply_text(
+            f"Распознал «{title}» на {dt.strftime('%d.%m.%Y %H:%M')} — но это уже в прошлом, проверь формулировку."
+        )
+        return
+
+    eid = add_event(title, dt)
+    await update.message.reply_text(
+        f"✅ Событие добавлено (#{eid}):\n«{title}»\n{dt.strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Напомню за 24ч, 12ч, 2ч, 1ч и 15 минут."
+    )
+
+
 # ---------- КНОПКИ НАПОМИНАНИЙ ----------
 
 def reminder_keyboard(eid):
     return InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("👍 Принято", callback_data=f"ack:{eid}"),
+            ],
             [
                 InlineKeyboardButton("✅ Сделано", callback_data=f"done:{eid}"),
                 InlineKeyboardButton("❌ Отменить", callback_data=f"cancel:{eid}"),
@@ -238,7 +351,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Событие не найдено.")
         return
 
-    if action == "done":
+    if action == "ack":
+        dt = datetime.fromisoformat(row["event_time"])
+        await query.edit_message_text(
+            f"👍 Принято, встреча в силе:\n«{row['title']}»\n{dt.strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=reminder_keyboard(eid),
+        )
+
+    elif action == "done":
         update_status(eid, "done")
         await query.edit_message_text(f"✅ Отмечено как сделано: «{row['title']}»")
 
@@ -294,6 +414,29 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         mark_reminded(row["id"], field)
 
 
+async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TIMEZONE)
+    today = now.date()
+
+    rows = list_active_events()
+    today_rows = [
+        r for r in rows
+        if datetime.fromisoformat(r["event_time"]).date() == today
+    ]
+
+    if not today_rows:
+        text = "📋 На сегодня событий нет."
+    else:
+        lines = ["📋 События на сегодня:"]
+        for r in today_rows:
+            dt = datetime.fromisoformat(r["event_time"])
+            lines.append(f"• {dt.strftime('%H:%M')} — {r['title']} (#{r['id']})")
+        text = "\n".join(lines)
+
+    for chat_id in ALLOWED_CHAT_IDS:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+
 # ---------- ЗАПУСК ----------
 
 def main():
@@ -304,9 +447,17 @@ def main():
     app.add_handler(CommandHandler("new", new_event))
     app.add_handler(CommandHandler("list", list_events))
     app.add_handler(CallbackQueryHandler(button_handler))
+    # Любое обычное сообщение (не команда) — пробуем распознать как событие
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_event))
 
     # Проверка напоминаний каждую минуту
     app.job_queue.run_repeating(check_reminders, interval=60, first=5)
+
+    # Ежедневная сводка утром
+    app.job_queue.run_daily(
+        daily_summary,
+        time=time(hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE, tzinfo=TIMEZONE),
+    )
 
     logger.info("Бот запущен.")
     app.run_polling()
