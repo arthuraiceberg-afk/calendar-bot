@@ -24,6 +24,7 @@ ALLOWED_CHAT_IDS = [
 DB_PATH = "events.db"
 
 REMINDER_OFFSETS = [
+    ("24h", timedelta(hours=24)),
     ("12h", timedelta(hours=12)),
     ("2h", timedelta(hours=2)),
     ("1h", timedelta(hours=1)),
@@ -48,6 +49,7 @@ def init_db():
             title TEXT NOT NULL,
             event_time TEXT NOT NULL,  -- ISO format
             status TEXT NOT NULL DEFAULT 'active',  -- active / done / cancelled
+            reminded_24h INTEGER DEFAULT 0,
             reminded_12h INTEGER DEFAULT 0,
             reminded_2h INTEGER DEFAULT 0,
             reminded_1h INTEGER DEFAULT 0,
@@ -82,7 +84,7 @@ def update_event_time(eid, new_time: datetime):
     conn = db()
     conn.execute(
         """UPDATE events SET event_time = ?, status = 'active',
-           reminded_12h = 0, reminded_2h = 0, reminded_1h = 0, reminded_15m = 0
+           reminded_24h = 0, reminded_12h = 0, reminded_2h = 0, reminded_1h = 0, reminded_15m = 0
            WHERE id = ?""",
         (new_time.isoformat(), eid),
     )
@@ -187,7 +189,7 @@ async def new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     eid = add_event(title, dt)
     await update.message.reply_text(
         f"✅ Событие добавлено (#{eid}):\n«{title}»\n{dt.strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"Напомню за 12ч, 2ч, 1ч и 15 минут."
+        f"Напомню за 24ч, 12ч, 2ч, 1ч и 15 минут."
     )
 
 
@@ -266,6 +268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- ФОНОВАЯ ПРОВЕРКА НАПОМИНАНИЙ ----------
 
 LABELS_RU = {
+    "24h": "через 24 часа",
     "12h": "через 12 часов",
     "2h": "через 2 часа",
     "1h": "через 1 час",
